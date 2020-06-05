@@ -1,5 +1,5 @@
 import argparse
-import os
+import os, math
 import numpy as np
 import tqdm, torchvision
 from skimage.color import rgb2lab
@@ -18,7 +18,7 @@ parser.add_argument('--dataset-path', type=str, default='./dataset', help='datas
 parser.add_argument('--checkpoints-path', type=str, default='./checkpoints', help='models are saved here (default: ./checkpoints)')
 parser.add_argument("--n_epochs", type=int, default=2, help="number of epochs of training")
 parser.add_argument('--color-space', type=str, default='lab', help='model color space [lab, rgb] (default: lab)')
-parser.add_argument("--batch_size", type=int, default=4, help="size of the batches")
+parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
 parser.add_argument("--lr", type=float, default=1e-3, help="adam: learning rate")
 parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
 parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
@@ -40,41 +40,61 @@ def weights_init_normal(m):
     elif classname.find("BatchNorm2d") != -1:
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
+# Calculate asymmetric TensorFlow-like 'SAME' padding for a convolution
+def get_same_padding(x, kernel_sz, stride, dialation):
+    return max((math.ceil(x / stride) - 1) * stride + (kernel_sz - 1) * dialation + 1 - x, 0)
+
+# Dynamically pad input x with 'SAME' padding for conv with specified args
+def pad_same(x, kernel_sz, stride, dialation=(1, 1), value=0.):
+    ih, iw = x.size()[-2:]
+    pad_h, pad_w = get_same_padding(ih, kernel_sz[0], stride[0], dialation[0]), get_same_padding(iw, kernel_sz[1],
+                                                                                                 stride[1],
+                                                                                                 dialation[1])
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, [pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2], value=value)
+    return x
 
 class GeneratorEncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, batch_norm=True):
+    def __init__(self, in_channels, out_channels, stride, batch_norm=True, kernel_size=4):
         super(GeneratorEncoderBlock, self).__init__()
+
         layer_modules = [
-            nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=stride)
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride)
         ]
         if batch_norm == True:
             layer_modules.append(nn.BatchNorm2d(out_channels))
         layer_modules.append(nn.LeakyReLU(negative_slope=0.2))
         self.encoder = nn.Sequential(*layer_modules)
+        self.stride = stride
+        self.kernel_size = kernel_size
 
     def forward(self, x):
+        x = pad_same(x, kernel_sz=(self.kernel_size, self.kernel_size), stride=(self.stride, self.stride))
         return self.encoder(x)
 
 class GeneratorDecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride, batch_norm=True):
+    def __init__(self, in_channels, out_channels, stride, batch_norm=True, kernel_size=4, padding= 1):
         super(GeneratorDecoderBlock, self).__init__()
         layer_modules = [
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=stride)
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding)
         ]
         if batch_norm == True:
             layer_modules.append(nn.BatchNorm2d(out_channels))
         layer_modules.append(nn.ReLU())
         self.decoder = nn.Sequential(*layer_modules)
+        self.stride = stride
+        self.kernel_size = kernel_size
+        self.padding = padding
 
     def forward(self, x):
-        return self.decoder(x)
+        x = self.decoder(x)
+        return x
 
 class Generator(nn.Module):
     def __init__(self, output_channels=3, training=True):
         super(Generator, self).__init__()
         self.output_channels = output_channels
         self.training = training
-
         self.encoder_block_1 = GeneratorEncoderBlock(1, 64, 1)
         self.encoder_block_2 = GeneratorEncoderBlock(64, 128, 2)
         self.encoder_block_3 = GeneratorEncoderBlock(128, 256, 2)
@@ -101,25 +121,27 @@ class Generator(nn.Module):
 
         output = self.decoder_block_1(output)
         output = nn.Dropout(p=0.5)(output)
-        output = torch.cat((layers[len(layers) - 0 - 2], output), dim=3)
+        output = output + layers[len(layers) - 0 - 2]
 
         output = self.decoder_block_2(output)
         output = nn.Dropout(p=0.5)(output)
-        output = torch.cat((layers[len(layers) - 1 - 2], output), dim=3)
+        output = output + layers[len(layers) - 1 - 2]
+
         output = self.decoder_block_3(output)
-        output = torch.cat((layers[len(layers) - 2 - 2], output), dim=3)
+        output = output + layers[len(layers) - 2 - 2]
+
         output = self.decoder_block_4(output)
-        output = torch.cat((layers[len(layers) - 3 - 2], output), dim=3)
+        output = output + layers[len(layers) - 3 - 2]
 
         conv = nn.Conv2d(64, self.output_channels, kernel_size=1, stride=1)
-        output = F.tanh(conv(output))
+        output = torch.tanh(conv(output))
         return output
 
 class Discriminator(nn.Module):
     def __init__(self, training=True):
         super(Discriminator, self).__init__()
         self.training = training
-        self.discriminator_block_1 = GeneratorEncoderBlock(1, 64, 2, False)
+        self.discriminator_block_1 = GeneratorEncoderBlock(3, 64, 2, False)
         self.discriminator_block_2 = GeneratorEncoderBlock(64, 128, 2)
         self.discriminator_block_3 = GeneratorEncoderBlock(128, 256, 2)
         self.discriminator_block_4 = GeneratorEncoderBlock(256, 512, 1)
@@ -159,7 +181,6 @@ def generic_transform_sk_4d(transform, in_type='', out_type=''):
     return apply_transform
 
 rgb_to_lab = generic_transform_sk_4d(rgb2lab)
-
 
 # Initialize generator and discriminator
 generator = Generator()
@@ -228,7 +249,6 @@ for epoch in range(opt.n_epochs):
                  + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
 
         g_loss.backward()
-
         optimizer_G.step()
 
         # ---------------------
@@ -241,6 +261,7 @@ for epoch in range(opt.n_epochs):
         d_loss = - F.logsigmoid(discriminator(real_color_imgs)).mean() - F.logsigmoid(0.9 - discriminator(colored_imgs_by_generator.detach())).mean()
         d_loss.backward()
         optimizer_D.step()
+        print("G loss: %.2f\tD loss: %.2f" % (g_loss, d_loss))
 
         if i and i % opt.sample_interval == 0:
             stacked_imgs_tensor = torch.cat((gray_scale_imgs, colored_imgs_by_generator, real_color_imgs), 0)
