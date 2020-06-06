@@ -1,7 +1,6 @@
 import argparse
 import os, math
 import tqdm, torchvision
-from skimage.color import rgb2lab, lab2rgb
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
@@ -15,11 +14,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=0, metavar='S', help='random seed (default: 0)')
 parser.add_argument('--dataset', type=str, default='cifar10', help='the name of dataset [places365, cifar10] (default: cifar10)')
 parser.add_argument('--dataset-path', type=str, default='dataset', help='dataset path (default: ./dataset)')
-parser.add_argument('--checkpoints-path', type=str, default='checkpoints', help='models are saved here (default: ./checkpoints)')
+parser.add_argument('--checkpoints-dir', type=str, default='checkpoints', help='models are saved here (default: ./checkpoints)')
 parser.add_argument('--image-dir', type=str, default='images', help='images saving path (default: ./images)')
 parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
-parser.add_argument('--color-space', type=str, default='lab', help='model color space [lab, rgb] (default: lab)')
 parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
+parser.add_argument("--plot_batch_size", type=int, default=12, help="size of the batches in plotting")
 parser.add_argument("--device", type=str, default='cuda', help="whether the algorithm executed on cpu or gpu")
 parser.add_argument("--lr", type=float, default=1e-3, help="adam: learning rate")
 parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
@@ -27,18 +26,31 @@ parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of firs
 parser.add_argument("--n_cpu", type=int, default=8, help="number of cpu threads to use during batch generation")
 parser.add_argument("--sample_interval", type=int, default=350, help="interval between image sampling")
 parser.add_argument("--l1-weight", type=float, default=100.0, help="weight on L1 term for generator gradient (default: 100.0)")
+parser.add_argument("--training", type=bool, default=True, help="training or testing")
 opt = parser.parse_args()
 print(opt)
 
 def mkdir(dir_path):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
-mkdir(opt.image_dir)
-mkdir(opt.checkpoints_path)
 
-cuda = True if opt.device == "cuda" else False
+image_dir = os.path.join(opt.image_dir, opt.dataset)
+training_img_dir = os.path.join(image_dir, "training")
+testing_img_dir = os.path.join(image_dir, "testing")
+dataset_dir = os.path.join(opt.dataset_path, opt.dataset)
+checkpoints_dir = os.path.join(opt.checkpoints_dir, opt.dataset)
 
+mkdir(dataset_dir)
+mkdir(image_dir)
+mkdir(training_img_dir)
+mkdir(testing_img_dir)
+mkdir(checkpoints_dir)
 
+cuda = True #if opt.device == "cuda" else False
+
+training = opt.training
+batch_size = opt.batch_size
+plot_batch_size = opt.plot_batch_size
 def weights_init_normal(m):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
@@ -46,6 +58,7 @@ def weights_init_normal(m):
     elif classname.find("BatchNorm2d") != -1:
         torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
         torch.nn.init.constant_(m.bias.data, 0.0)
+
 # Calculate asymmetric TensorFlow-like 'SAME' padding for a convolution
 def get_same_padding(x, kernel_sz, stride, dialation):
     return max((math.ceil(x / stride) - 1) * stride + (kernel_sz - 1) * dialation + 1 - x, 0)
@@ -163,126 +176,152 @@ class Discriminator(nn.Module):
         output = self.last_layer(output)
         return output
 
-def convert(input_, type_):
-    return {
-        'float': input_.float(),
-        'double': input_.double(),
-    }.get(type_, input_)
-
-def generic_transform_sk_4d(transform, in_type='', out_type=''):
-    def apply_transform(input_):
-        to_squeeze = (input_.dim() == 3)
-        device = input_.device
-        input_ = input_.cpu()
-        input_ = convert(input_, in_type)
-
-        if to_squeeze:
-            input_ = input_.unsqueeze(0)
-
-        input_ = input_.permute(0, 2, 3, 1).numpy()
-        transformed = transform(input_)
-        output = torch.from_numpy(transformed).float().permute(0, 3, 1, 2)
-        if to_squeeze:
-            output = output.squeeze(0)
-        output = convert(output, out_type)
-        return output.to(device)
-    return apply_transform
-
-rgb_to_lab = generic_transform_sk_4d(rgb2lab)
-lab_to_rgb = generic_transform_sk_4d(lab2rgb)
-# Initialize generator and discriminator
-generator = Generator('G')
-discriminator = Discriminator('D')
-# Loss function
-bce_loss_with_logits = torch.nn.BCEWithLogitsLoss()
-if cuda:
-    generator.cuda()
-    discriminator.cuda()
-    bce_loss_with_logits.cuda()
-# Initialize weights
-generator.apply(weights_init_normal)
-discriminator.apply(weights_init_normal)
-
 # Configure dataset loader
 loading_transform = transforms.Compose(
     [transforms.ToTensor(),
      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
 gray_scale_transform = transforms.Compose(
-        [transforms.ToPILImage(), transforms.Grayscale(num_output_channels=1), transforms.ToTensor(),
-         transforms.Normalize(mean=[0.5], std=[0.5])])
+    [transforms.ToPILImage(), transforms.Grayscale(num_output_channels=1), transforms.ToTensor(),
+     transforms.Normalize(mean=[0.5], std=[0.5])])
 
-dataset_dir = os.path.join(opt.dataset_path, opt.dataset)
-batch_size = opt.batch_size
+# Initialize generator and discriminator
+generator = Generator('G', training=training)
+discriminator = Discriminator('D', training=training)
 
-num_workers = 1
-trainset_color = torchvision.datasets.CIFAR10(root=dataset_dir, train=True,
-                                        download=False, transform=loading_transform)
-trainloader_color = torch.utils.data.DataLoader(trainset_color, batch_size=batch_size,
-                                          shuffle=True, num_workers=num_workers, drop_last=True)
+if cuda:
+    generator.cuda()
+    discriminator.cuda()
+if training:
+    # Loss function
+    bce_loss_with_logits = torch.nn.BCEWithLogitsLoss()
+    if cuda:
+        bce_loss_with_logits.cuda()
 
-testset = torchvision.datasets.CIFAR10(root=dataset_dir, train=False,
-                                       download=False, transform=loading_transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                         shuffle=False, num_workers=num_workers, drop_last=True)
+    # Initialize weights
+    generator.apply(weights_init_normal)
+    discriminator.apply(weights_init_normal)
 
-# Optimizers
-optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
-optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
-# ----------
-#  Training
-# ----------
-global_step = 0
-Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+    trainset_color = torchvision.datasets.CIFAR10(root=dataset_dir, train=True,
+                                            download=False, transform=loading_transform)
+    trainloader_color = torch.utils.data.DataLoader(trainset_color, batch_size=batch_size,
+                                              shuffle=True, num_workers=1, drop_last=True)
 
-for epoch in range(opt.n_epochs):
-    for i, (real_color_imgs,_) in tqdm.tqdm(enumerate(trainloader_color)):
-        # Adversarial ground truths
-        valid = Tensor(real_color_imgs.shape[0], 1).fill_(0.9).unsqueeze(0).unsqueeze(0).permute(2, 0, 1, 3) #1.0
-        fake = Tensor(real_color_imgs.shape[0], 1).fill_(0.0).unsqueeze(0).unsqueeze(0).permute(2, 0, 1, 3)
+    # Optimizers
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
-        gray_scale_imgs = torch.stack([gray_scale_transform(color_img) for color_img in real_color_imgs])
-        # real_color_imgs = rgb_to_lab(real_color_imgs) # convert imgs from RGB to L*A*B color space
-        if cuda:
-            gray_scale_imgs = gray_scale_imgs.cuda()
-            real_color_imgs = real_color_imgs.cuda()
+    # ----------
+    #  Training
+    # ----------
+    global_step = 0
+    Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
-        # -----------------
-        #  Train Generator
-        # -----------------
+    for epoch in range(opt.n_epochs):
+        g_losses = []
+        d_losses = []
+        for i, (real_color_imgs,_) in tqdm.tqdm(enumerate(trainloader_color)):
+            # Adversarial ground truths
+            valid = Tensor(real_color_imgs.shape[0], 1).fill_(0.9).unsqueeze(0).unsqueeze(0).permute(2, 0, 1, 3) #1.0
+            fake = Tensor(real_color_imgs.shape[0], 1).fill_(0.0).unsqueeze(0).unsqueeze(0).permute(2, 0, 1, 3)
 
-        optimizer_G.zero_grad()
-        # Generate a batch of images
-        colored_imgs_by_generator = generator(gray_scale_imgs)
+            gray_scale_imgs = torch.stack([gray_scale_transform(color_img) for color_img in real_color_imgs])
+            # real_color_imgs = rgb_to_lab(real_color_imgs) # convert imgs from RGB to L*A*B color space
+            if cuda:
+                gray_scale_imgs = gray_scale_imgs.cuda()
+                real_color_imgs = real_color_imgs.cuda()
 
-        # Loss measures generator's ability to fool the discriminator
-        # g_loss = - F.logsigmoid(discriminator(colored_imgs_by_generator)).sum() + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
-        g_loss = bce_loss_with_logits(discriminator(colored_imgs_by_generator), valid) + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
+            # -----------------
+            #  Train Generator
+            # -----------------
 
-        g_loss.backward()
-        optimizer_G.step()
+            optimizer_G.zero_grad()
+            # Generate a batch of images
+            colored_imgs_by_generator = generator(gray_scale_imgs)
 
-        # ---------------------
-        #  Train Discriminator
-        # ---------------------
+            # Loss measures generator's ability to fool the discriminator
+            # g_loss = - F.logsigmoid(discriminator(colored_imgs_by_generator)).sum() + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
+            g_loss = bce_loss_with_logits(discriminator(colored_imgs_by_generator), valid) + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
+            g_losses.append(g_loss)
+            g_loss.backward()
+            optimizer_G.step()
 
-        optimizer_D.zero_grad()
+            # ---------------------
+            #  Train Discriminator
+            # ---------------------
 
-        # Measure discriminator's ability to classify real from generated samples
-        # d_loss = - F.logsigmoid(discriminator(real_color_imgs)).sum() - F.logsigmoid(0.9 - discriminator(colored_imgs_by_generator.detach())).sum()
-        d_loss = (bce_loss_with_logits(discriminator(real_color_imgs), valid) + bce_loss_with_logits(discriminator(colored_imgs_by_generator.detach()), fake)) / 2.0
+            optimizer_D.zero_grad()
 
-        d_loss.backward()
-        optimizer_D.step()
-        if i and i % 50 == 0:
-            print("G loss: %.2f\tD loss: %.2f" % (g_loss.item(), d_loss.item()))
-        if i and i % opt.sample_interval == 0:
+            # Measure discriminator's ability to classify real from generated samples
+            # d_loss = - F.logsigmoid(discriminator(real_color_imgs)).sum() - F.logsigmoid(0.9 - discriminator(colored_imgs_by_generator.detach())).sum()
+            d_loss = (bce_loss_with_logits(discriminator(real_color_imgs), valid) + bce_loss_with_logits(discriminator(colored_imgs_by_generator.detach()), fake)) / 2.0
+            d_losses.append(d_loss)
+            d_loss.backward()
+            optimizer_D.step()
+            if i and (i + 1) % 50 == 0:
+                print("Epoch: %d, Iter: %d,\tG loss: %.2f,\tD loss: %.2f" % (epoch, i + 1, g_loss.item(), d_loss.item()))
+            if i and (i + 1) % opt.sample_interval == 0:
+                gray_scale_imgs = gray_scale_imgs.to('cpu')[0:plot_batch_size, :, :, :].repeat(1, 3, 1, 1)
+                colored_imgs_by_generator = colored_imgs_by_generator.detach().to('cpu')[0:plot_batch_size, :, :, :]
+                real_color_imgs = real_color_imgs.to('cpu')[0:plot_batch_size, :, :, :]
+                # stacked_imgs_tensor = torch.cat((gray_scale_imgs.repeat(1, 3, 1, 1), lab_to_rgb(colored_imgs_by_generator.detach()), lab_to_rgb(real_color_imgs)), 0)
+                stacked_imgs_tensor = torch.cat((gray_scale_imgs, colored_imgs_by_generator, real_color_imgs), 0)
+                grid_img = torchvision.utils.make_grid(stacked_imgs_tensor, nrow=plot_batch_size)
+                image_path = "%s/Epoch%d_%d.png" % (training_img_dir, epoch, i + 1)
+                save_image(grid_img, image_path)
+                print("Validation image %s saved" % image_path)
+        loss_dict = {
+            'epoch': epoch,
+            'd_losses': d_losses,
+            'g_losses': g_losses,
+        }
+        with torch.no_grad():
+            loss_path = '%s/loss_%04d.pt' % (checkpoints_dir, epoch)
+            print("%s saved" % loss_path)
+            torch.save(loss_dict, loss_path)
+
+        if epoch and (epoch + 1) % 50 == 0:
+            model_dict = {
+                'epoch': epoch,
+                'generator_state_dict': generator.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict(),
+                'discriminator_state_dict': discriminator.state_dict(),
+                'optimizer_D_state_dict': optimizer_D.state_dict(),
+            }
+            with torch.no_grad():
+                model_path = '%s/model_%04d.pt' % (checkpoints_dir, epoch)
+                print("%s saved" % model_path)
+                torch.save(model_dict, model_path)
+else:
+    model_path = '%s/model_%04d.pt' % (checkpoints_dir, opt.n_epochs - 1)
+    checkpoint = torch.load(model_path)
+
+    testset = torchvision.datasets.CIFAR10(root=dataset_dir, train=False,
+                                           download=False, transform=loading_transform)
+    testloader = DataLoader(testset, batch_size=plot_batch_size,
+                                         shuffle=False, num_workers=1, drop_last=True)
+    if cuda:
+        generator.cuda()
+        discriminator.cuda()
+    generator.load_state_dict(checkpoint['generator_state_dict'])
+    generator.eval()
+
+    discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+    discriminator.eval()
+
+    for i, (real_color_imgs, _) in enumerate(testloader):
+        if i and (i + 1) % 10 == 0:
+            gray_scale_imgs = torch.stack([gray_scale_transform(color_img) for color_img in real_color_imgs])
+
+            if cuda:
+                real_color_imgs = real_color_imgs.cuda()
+                gray_scale_imgs = gray_scale_imgs.cuda()
+
+            colored_imgs_by_generator = generator(gray_scale_imgs)
+
             # stacked_imgs_tensor = torch.cat((gray_scale_imgs.repeat(1, 3, 1, 1), lab_to_rgb(colored_imgs_by_generator.detach()), lab_to_rgb(real_color_imgs)), 0)
             stacked_imgs_tensor = torch.cat((gray_scale_imgs.repeat(1, 3, 1, 1), colored_imgs_by_generator.detach(), real_color_imgs), 0)
-            grid_img = torchvision.utils.make_grid(stacked_imgs_tensor, nrow=batch_size)
-            save_image(grid_img, "%s/Epoch%d_%d.png" % (opt.image_dir, epoch, i + 1))
-    with torch.no_grad():
-        model_path = '%s/model_%04d.pt' % (opt.checkpoints_path, epoch)
-        print("%s saved" % model_path)
-        torch.save((generator, discriminator), model_path)
+            grid_img = torchvision.utils.make_grid(stacked_imgs_tensor, nrow=plot_batch_size)
+            save_image(grid_img, "%s/%d.png" % (testing_img_dir, i + 1))
+            print("tested %d batch" % (i + 1))
