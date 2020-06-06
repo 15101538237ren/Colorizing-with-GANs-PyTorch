@@ -15,8 +15,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--seed', type=int, default=0, metavar='S', help='random seed (default: 0)')
 parser.add_argument('--dataset', type=str, default='cifar10', help='the name of dataset [places365, cifar10] (default: cifar10)')
 parser.add_argument('--dataset-path', type=str, default='dataset', help='dataset path (default: ./dataset)')
-parser.add_argument('--checkpoints-path', type=str, default='checkpoints', help='models are saved here (default: ./checkpoints)')
-parser.add_argument('--image-dir', type=str, default='images', help='images saving path (default: ./images)')
+parser.add_argument('--checkpoints-dirname', type=str, default='checkpoints', help='models are saved here (default: ./checkpoints)')
+parser.add_argument('--image-dirname', type=str, default='images', help='images saving path (default: ./images)')
 parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
 parser.add_argument('--color-space', type=str, default='lab', help='model color space [lab, rgb] (default: lab)')
 parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
@@ -33,8 +33,13 @@ print(opt)
 def mkdir(dir_path):
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
-mkdir(opt.image_dir)
-mkdir(opt.checkpoints_path)
+dataset_dir = os.path.join(opt.dataset_path, opt.dataset)
+image_dir = os.path.join(opt.image_dirname, opt.dataset)
+checkpoints_dir = os.path.join(opt.checkpoints_dirname, opt.dataset)
+
+mkdir(dataset_dir)
+mkdir(image_dir)
+mkdir(checkpoints_dir)
 
 cuda = True if opt.device == "cuda" else False
 
@@ -212,19 +217,12 @@ gray_scale_transform = transforms.Compose(
         [transforms.ToPILImage(), transforms.Grayscale(num_output_channels=1), transforms.ToTensor(),
          transforms.Normalize(mean=[0.5], std=[0.5])])
 
-dataset_dir = os.path.join(opt.dataset_path, opt.dataset)
 batch_size = opt.batch_size
 
 num_workers = 1
-trainset_color = torchvision.datasets.CIFAR10(root=dataset_dir, train=True,
-                                        download=False, transform=loading_transform)
+trainset_color = torchvision.datasets.Flickr30k(root=dataset_dir, transform=loading_transform)
 trainloader_color = torch.utils.data.DataLoader(trainset_color, batch_size=batch_size,
                                           shuffle=True, num_workers=num_workers, drop_last=True)
-
-testset = torchvision.datasets.CIFAR10(root=dataset_dir, train=False,
-                                       download=False, transform=loading_transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                         shuffle=False, num_workers=num_workers, drop_last=True)
 
 # Optimizers
 optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
@@ -281,8 +279,8 @@ for epoch in range(opt.n_epochs):
             # stacked_imgs_tensor = torch.cat((gray_scale_imgs.repeat(1, 3, 1, 1), lab_to_rgb(colored_imgs_by_generator.detach()), lab_to_rgb(real_color_imgs)), 0)
             stacked_imgs_tensor = torch.cat((gray_scale_imgs.repeat(1, 3, 1, 1), colored_imgs_by_generator.detach(), real_color_imgs), 0)
             grid_img = torchvision.utils.make_grid(stacked_imgs_tensor, nrow=batch_size)
-            save_image(grid_img, "%s/Epoch%d_%d.png" % (opt.image_dir, epoch, i + 1))
+            save_image(grid_img, "%s/Epoch%d_%d.png" % (image_dir, epoch, i + 1))
     with torch.no_grad():
-        model_path = '%s/model_%04d.pt' % (opt.checkpoints_path, epoch)
+        model_path = '%s/model_%04d.pt' % (checkpoints_dir, epoch)
         print("%s saved" % model_path)
         torch.save((generator, discriminator), model_path)
