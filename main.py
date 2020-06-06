@@ -1,12 +1,11 @@
 import argparse
 import os, math
-import numpy as np
 import tqdm, torchvision
-from skimage.color import rgb2lab
-
+from skimage.color import rgb2lab, lab2rgb
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
+from torch.autograd import Variable
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -16,9 +15,11 @@ parser.add_argument('--seed', type=int, default=0, metavar='S', help='random see
 parser.add_argument('--dataset', type=str, default='cifar10', help='the name of dataset [places365, cifar10] (default: cifar10)')
 parser.add_argument('--dataset-path', type=str, default='./dataset', help='dataset path (default: ./dataset)')
 parser.add_argument('--checkpoints-path', type=str, default='./checkpoints', help='models are saved here (default: ./checkpoints)')
-parser.add_argument("--n_epochs", type=int, default=2, help="number of epochs of training")
+parser.add_argument('--image-dir', type=str, default='./images', help='images saving path (default: ./images)')
+parser.add_argument("--n_epochs", type=int, default=200, help="number of epochs of training")
 parser.add_argument('--color-space', type=str, default='lab', help='model color space [lab, rgb] (default: lab)')
 parser.add_argument("--batch_size", type=int, default=64, help="size of the batches")
+parser.add_argument("--device", type=str, default='cuda', help="whether the algorithm executed on cpu or gpu")
 parser.add_argument("--lr", type=float, default=1e-3, help="adam: learning rate")
 parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
 parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
@@ -31,8 +32,13 @@ parser.add_argument("--l1-weight", type=float, default=100.0, help="weight on L1
 opt = parser.parse_args()
 print(opt)
 
-cuda = True if torch.cuda.is_available() else False
+cuda = True if opt.device == "cuda" else False
 
+def mkdir(dir_path):
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+mkdir(opt.image_dir)
+mkdir(opt.checkpoints_path)
 def weights_init_normal(m):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
@@ -105,6 +111,7 @@ class Generator(nn.Module):
         self.decoder_block_2 = GeneratorDecoderBlock(512, 256, 2)
         self.decoder_block_3 = GeneratorDecoderBlock(256, 128, 2)
         self.decoder_block_4 = GeneratorDecoderBlock(128, 64, 2)
+        self.last_layer = nn.Conv2d(64, self.output_channels, kernel_size=1, stride=1)
 
     def forward(self, inputs):
         layers = []
@@ -133,8 +140,7 @@ class Generator(nn.Module):
         output = self.decoder_block_4(output)
         output = output + layers[len(layers) - 3 - 2]
 
-        conv = nn.Conv2d(64, self.output_channels, kernel_size=1, stride=1)
-        output = torch.tanh(conv(output))
+        output = torch.tanh(self.last_layer(output))
         return output
 
 class Discriminator(nn.Module):
@@ -181,14 +187,16 @@ def generic_transform_sk_4d(transform, in_type='', out_type=''):
     return apply_transform
 
 rgb_to_lab = generic_transform_sk_4d(rgb2lab)
-
+lab_to_rgb = generic_transform_sk_4d(lab2rgb)
 # Initialize generator and discriminator
 generator = Generator()
 discriminator = Discriminator()
-
+# Loss function
+adversarial_loss = torch.nn.BCEWithLogitsLoss()
 if cuda:
     generator.cuda()
     discriminator.cuda()
+    adversarial_loss.cuda()
 # Initialize weights
 generator.apply(weights_init_normal)
 discriminator.apply(weights_init_normal)
@@ -199,26 +207,21 @@ loading_transform = transforms.Compose(
      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
 
 gray_scale_transform = transforms.Compose(
-        [transforms.Grayscale(num_output_channels=1), transforms.ToTensor(),
+        [transforms.ToPILImage(), transforms.Grayscale(num_output_channels=1), transforms.ToTensor(),
          transforms.Normalize(mean=[0.5], std=[0.5])])
 
 dataset_dir = os.path.join(opt.dataset_path, opt.dataset)
 batch_size = opt.batch_size
+num_workers = 1
 trainset_color = torchvision.datasets.CIFAR10(root=dataset_dir, train=True,
                                         download=False, transform=loading_transform)
 trainloader_color = torch.utils.data.DataLoader(trainset_color, batch_size=batch_size,
-                                          shuffle=True, num_workers=4, drop_last=True)
-
-trainset_grayscale = torchvision.datasets.CIFAR10(root=dataset_dir, train=True,
-                                        download=False, transform=gray_scale_transform)
-trainloader_grayscale = torch.utils.data.DataLoader(trainset_grayscale, batch_size=batch_size,
-                                          shuffle=True, num_workers=4, drop_last=True)
-
+                                          shuffle=True, num_workers=num_workers, drop_last=True)
 
 testset = torchvision.datasets.CIFAR10(root=dataset_dir, train=False,
                                        download=False, transform=loading_transform)
 testloader = torch.utils.data.DataLoader(testset, batch_size=batch_size,
-                                         shuffle=False, num_workers=4, drop_last=True)
+                                         shuffle=False, num_workers=num_workers, drop_last=True)
 
 # Optimizers
 optimizer_G = torch.optim.Adam(generator.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
@@ -228,13 +231,20 @@ optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=opt.lr, betas=(opt
 #  Training
 # ----------
 global_step = 0
+Tensor = torch.cuda.FloatTensor if cuda else torch.FloatTensor
 
 for epoch in range(opt.n_epochs):
-    for i, imgs in tqdm.tqdm(enumerate(zip(trainloader_grayscale, trainloader_color))):
+    for i, (real_color_imgs,_) in tqdm.tqdm(enumerate(trainloader_color)):
+        # Adversarial ground truths
+        valid = Tensor(real_color_imgs.shape[0], 1).fill_(0.9).unsqueeze(0).unsqueeze(0).permute(2, 0, 1, 3) #1.0
+        fake = Tensor(real_color_imgs.shape[0], 1).fill_(0.0).unsqueeze(0).unsqueeze(0).permute(2, 0, 1, 3)
 
-        gray_scale_imgs, _ = imgs[0]
-        real_color_imgs, _ = imgs[1]
+        gray_scale_imgs = torch.stack([gray_scale_transform(color_img) for color_img in real_color_imgs])
         real_color_imgs = rgb_to_lab(real_color_imgs) # convert imgs from RGB to L*A*B color space
+        # real_color_imgs = Variable(real_color_imgs.type(Tensor))
+        if cuda:
+            gray_scale_imgs = gray_scale_imgs.cuda()
+            real_color_imgs = real_color_imgs.cuda()
 
         # -----------------
         #  Train Generator
@@ -245,8 +255,10 @@ for epoch in range(opt.n_epochs):
         colored_imgs_by_generator = generator(gray_scale_imgs)
 
         # Loss measures generator's ability to fool the discriminator
-        g_loss = - F.logsigmoid(discriminator(colored_imgs_by_generator)).mean() \
-                 + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
+        # g_loss = - F.logsigmoid(discriminator(colored_imgs_by_generator)).mean() \
+
+
+        g_loss = adversarial_loss(discriminator(colored_imgs_by_generator), valid) + torch.abs(real_color_imgs - colored_imgs_by_generator).mean() * opt.l1_weight
 
         g_loss.backward()
         optimizer_G.step()
@@ -258,13 +270,18 @@ for epoch in range(opt.n_epochs):
         optimizer_D.zero_grad()
 
         # Measure discriminator's ability to classify real from generated samples
-        d_loss = - F.logsigmoid(discriminator(real_color_imgs)).mean() - F.logsigmoid(0.9 - discriminator(colored_imgs_by_generator.detach())).mean()
+        # d_loss = - F.logsigmoid(discriminator(real_color_imgs)).mean() - F.logsigmoid(0.9 - discriminator(colored_imgs_by_generator.detach())).mean()
+        real_loss = adversarial_loss(discriminator(real_color_imgs), valid)
+        fake_loss = adversarial_loss(discriminator(colored_imgs_by_generator.detach()), fake)
+        d_loss = (real_loss + fake_loss) / 2.0
+
         d_loss.backward()
         optimizer_D.step()
         print("G loss: %.2f\tD loss: %.2f" % (g_loss, d_loss))
 
         if i and i % opt.sample_interval == 0:
-            stacked_imgs_tensor = torch.cat((gray_scale_imgs, colored_imgs_by_generator, real_color_imgs), 0)
+            stacked_imgs_tensor = torch.cat((gray_scale_imgs.repeat(1, 3, 1, 1), lab_to_rgb(colored_imgs_by_generator.detach()), lab_to_rgb(real_color_imgs)), 0)
             grid_img = torchvision.utils.make_grid(stacked_imgs_tensor, nrow=batch_size)
-            print(grid_img.shape)
-            save_image(grid_img, "images/%d.png" % (i + 1))
+            save_image(grid_img, "%s/Epoch%d_%d.png" % (opt.image_dir, epoch, i + 1))
+    with torch.no_grad():
+        torch.save((generator, discriminator), '%s/model_%04d.pt' % (opt.checkpoints_path, epoch))
